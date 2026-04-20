@@ -213,15 +213,49 @@ def main():
     current_waypoint = carla_map.get_waypoint(spawn_point.location)
     reference_path = []
     
-    # 2. 沿着车道不断往前伸展，每隔2米取一个点，取100个点（总计200米）
+    # 2. 沿着车道生成“全图级长路径”（不再固定 200m）
+    # 策略：每 2m 取点，路口优先同车道，若形成闭环则在完成一圈后停止。
+    def _pick_next_waypoint(curr_wp, next_wps):
+        if not next_wps:
+            return None
+
+        same_lane = [
+            cand for cand in next_wps
+            if cand.road_id == curr_wp.road_id and cand.lane_id == curr_wp.lane_id
+        ]
+        candidates = same_lane if len(same_lane) > 0 else list(next_wps)
+
+        curr_yaw = math.radians(curr_wp.transform.rotation.yaw)
+        best_wp = None
+        best_cost = float('inf')
+        for cand in candidates:
+            cand_yaw = math.radians(cand.transform.rotation.yaw)
+            dyaw = abs((cand_yaw - curr_yaw + math.pi) % (2 * math.pi) - math.pi)
+            cost = dyaw
+            if best_wp is None or cost < best_cost:
+                best_wp = cand
+                best_cost = cost
+        return best_wp
+
     wp = current_waypoint
-    for _ in range(100):
+    visited = {}
+    max_ref_points = 8000
+    for _ in range(max_ref_points):
         reference_path.append(wp)
-        next_wps = wp.next(2.0)  # 获取前方 2m 处的路点列表
-        if next_wps:
-            wp = next_wps[0]     # 一般取第一个（如果没有变道/分叉）
-        else:
+
+        # 通过 (road,section,lane,s) 检测回环，避免无限循环
+        key = (int(wp.road_id), int(wp.section_id), int(wp.lane_id), int(round(float(wp.s) * 2.0)))
+        visited[key] = visited.get(key, 0) + 1
+        if visited[key] >= 2 and len(reference_path) > 800:
             break
+
+        next_wps = wp.next(2.0)
+        if not next_wps:
+            break
+        nxt = _pick_next_waypoint(wp, next_wps)
+        if nxt is None:
+            break
+        wp = nxt
             
     # 3. 将这些参考点在仿真界面的空中画出来（绿色小点，z轴抬高一点防遮挡）
     for w in reference_path:
@@ -230,7 +264,14 @@ def main():
         # 用 Debug 画笔一直留存在画面中 (life_time=0 永不消失)
         world.debug.draw_point(draw_loc, size=0.1, color=carla.Color(0,255,0), life_time=0.0)
 
-    print(f"🛣️ 成功生成一条包含 {len(reference_path)} 个 Waypoint 的前向参考路径")
+    route_len = 0.0
+    if len(reference_path) > 1:
+        for i in range(1, len(reference_path)):
+            p0 = reference_path[i - 1].transform.location
+            p1 = reference_path[i].transform.location
+            route_len += math.hypot(p1.x - p0.x, p1.y - p0.y)
+
+    print(f"🛣️ 成功生成全图级参考路径: {len(reference_path)} 个 Waypoint, 约 {route_len:.1f} m")
 
     # ================== 3. 加装激光雷达 ==================
     # 3.1 找到激光雷达蓝图
@@ -310,7 +351,7 @@ def main():
     vehicle.set_autopilot(False)
     
     # 实例化 Python 版本的 NMPC
-    nmpc_horizon = 10  # 看看往前预测 10 个点
+    nmpc_horizon = 15  # 默认预测步数 15，控制器内部会按曲率自适应
     planner = NMPCController(N=nmpc_horizon, dt=0.1)
 
     target_wp_index = 0
@@ -482,6 +523,31 @@ def main():
 
         return dyn_obstacles, stat_obstacles_plan, stat_obstacles_viz
 
+    def estimate_path_curvature(path_xyz):
+        """
+        估计局部参考轨迹曲率（取前半段中位值，强调即将到来的弯道）。
+        path_xyz: np.ndarray shape (N, 3) -> [x,y,yaw]
+        """
+        if path_xyz is None or len(path_xyz) < 3:
+            return 0.0
+
+        arr = np.asarray(path_xyz, dtype=float)
+        if arr.ndim != 2 or arr.shape[0] < 3:
+            return 0.0
+
+        n = arr.shape[0]
+        seg_n = max(3, n // 2)
+        dx = np.diff(arr[:seg_n, 0])
+        dy = np.diff(arr[:seg_n, 1])
+        ds = np.hypot(dx, dy)
+        ds = np.maximum(ds, 1e-4)
+        dyaw = np.diff(arr[:seg_n, 2])
+        dyaw = np.arctan2(np.sin(dyaw), np.cos(dyaw))
+        kappa = np.abs(dyaw / ds)
+        if kappa.size == 0:
+            return 0.0
+        return float(np.median(kappa))
+
     # ================== 6. 主循环：更新跟随视角 + 打印车速 ==================
     try:
         while True:
@@ -519,18 +585,36 @@ def main():
             velocity = vehicle.get_velocity()
             current_v = math.hypot(velocity.x, velocity.y)
             current_steer = vehicle.get_control().steer
-            max_steer_rad = 50.0 * math.pi / 180.0
+            max_steer_rad = 30.0 * math.pi / 180.0
             actual_steer_rad = current_steer * max_steer_rad
 
             # =============== 【新增】使用封装后的本地规划器接口 ===============
             replan_time = frame_count * 0.05
+
+            # 将 Carla 中每节挂车的实时位姿回传给重规划，避免使用车头姿态重置挂车状态。
+            current_trailer_states = None
+            if len(potential_trailers) > 0:
+                trailer_states_buf = []
+                for tr in potential_trailers:
+                    if not tr.is_alive:
+                        continue
+                    ttf = tr.get_transform()
+                    trailer_states_buf.append({
+                        'x': float(ttf.location.x),
+                        'y': float(ttf.location.y),
+                        'yaw': float(math.radians(ttf.rotation.yaw)),
+                    })
+                if len(trailer_states_buf) > 0:
+                    current_trailer_states = trailer_states_buf
+
             best_tentacle_traj = local_planner_wrapper.run_step(
                 current_loc=current_loc,
                 current_yaw_rad=current_yaw_rad,
                 current_v=current_v,
                 dyn_obs=dyn_obs,
                 stat_obs=stat_obs_plan,
-                replan_time=replan_time
+                replan_time=replan_time,
+                current_trailer_states=current_trailer_states,
             )
             # ================================================================
 
@@ -576,7 +660,10 @@ def main():
                 ax.legend(loc='upper right')
                 
                 # 仅仅更新画布内部缓存
-                plt.pause(0.001)
+                try:
+                    plt.pause(0.001)
+                except Exception:
+                    pass
 
             # --- 6.3 【核心】自定义位置寻迹控制 ---
             final_target_v = 0.0
@@ -592,13 +679,13 @@ def main():
                 # 计算二维距离
                 dist = math.hypot(target_loc.x - current_loc.x, target_loc.y - current_loc.y)
                 
-                # 如果车辆距离目标点小于 3.0 米，说明摸到了当前的绿点，切换到下一个绿点
-                if dist < 3.0:
+                # 减小切点半径，避免在弯道提前切到后续点导致“提早转弯”
+                if dist < 1.8:
                     target_wp_index += 1
                 
                 if target_wp_index < len(reference_path):
                     # 【核心核心】：调用刚刚封装好的接口拿去 NMPC 的追踪轨迹和速度
-                    state = [current_loc.x, current_loc.y, current_yaw_rad]
+                    state = [current_loc.x, current_loc.y, current_yaw_rad, current_v]
                     
                     target_trajectory, target_v = local_planner_wrapper.get_tracked_trajectory(
                         nmpc_horizon=nmpc_horizon,
@@ -608,10 +695,42 @@ def main():
                     )
 
                     # 调用我们自己写的 Python 版本 NMPC
-                    optimized_v, target_steer_rad = planner.solve(state, target_trajectory)
-                    
-                    # 【核心修复2】完全信任触须安全速度！弃用 NMPC 计算的被原地迷惑的 optimized_v
-                    final_target_v = target_v
+                    # 远离动态障碍时，提高速度参考下限（仅直道生效），避免重载低速爬行。
+                    local_kappa = estimate_path_curvature(target_trajectory)
+                    target_v_ref = float(target_v)
+                    nearest_dyn = float(local_planner_wrapper.nearest_dynamic_obs_dist)
+                    is_straight = local_kappa < 0.035
+                    if is_straight:
+                        if nearest_dyn > 22.0:
+                            target_v_ref = max(target_v_ref, 3.0)
+                        elif nearest_dyn > 14.0:
+                            target_v_ref = max(target_v_ref, 2.2)
+                        elif nearest_dyn > 10.0:
+                            target_v_ref = max(target_v_ref, 1.6)
+
+                    # 弯道限速：按横向加速度上限计算速度帽，抑制“全油门过弯”
+                    a_lat_limit = 1.6
+                    if local_kappa > 1e-4:
+                        v_curve_cap = math.sqrt(a_lat_limit / local_kappa)
+                        # 给一个下限，避免极端曲率下直接锁死
+                        v_curve_cap = max(0.8, min(v_curve_cap, 6.0))
+                        target_v_ref = min(target_v_ref, v_curve_cap)
+
+                    optimized_v, target_steer_rad = planner.solve(
+                        state,
+                        target_trajectory,
+                        target_speed=target_v_ref,
+                    )
+
+                    # 由 NMPC 同时控制速度与转向；target_v 作为速度参考而非直接执行值
+                    final_target_v = max(0.0, float(optimized_v))
+
+                    # 结合实际转角再做一次横向加速度限速，避免求解噪声导致的弯中速度偏高
+                    cmd_kappa = abs(math.tan(target_steer_rad) / max(1e-6, 3.0))
+                    if cmd_kappa > 1e-4:
+                        v_cmd_curve_cap = math.sqrt(a_lat_limit / cmd_kappa)
+                        v_cmd_curve_cap = max(0.8, min(v_cmd_curve_cap, 6.0))
+                        final_target_v = min(final_target_v, v_cmd_curve_cap)
                     
                     # 将 NMPC 优化出来的物理命令转化为 Carla 阿克曼控制量
                     out_steer = max(-1.0, min(1.0, target_steer_rad / max_steer_rad))
@@ -624,20 +743,35 @@ def main():
                     else:
                         if speed_error > 0.0:
                             # 牵引增强：重载起步给更高基础油门，防止长期<1km/h的爬行。
-                            throttle = min(1.0, 0.28 + speed_error * 1.0)
-                            if current_v < 1.2 and final_target_v > 2.0:
-                                throttle = max(throttle, 0.45)
+                            throttle = min(1.0, 0.40 + speed_error * 1.6)
+
+                            # 弯道油门上限，进一步抑制“全油门过弯”
+                            if local_kappa > 0.08:
+                                throttle = min(throttle, 0.38)
+                            elif local_kappa > 0.05:
+                                throttle = min(throttle, 0.50)
+                            elif local_kappa > 0.03:
+                                throttle = min(throttle, 0.62)
+
+                            if current_v < 1.5 and final_target_v > 1.5:
+                                throttle = max(throttle, 0.75)
+                            if current_v < 0.8 and final_target_v > 2.5:
+                                throttle = max(throttle, 0.90)
+
+                            # 若处于明显弯道，禁止起步增强把油门重新抬高到过激值
+                            if local_kappa > 0.03:
+                                throttle = min(throttle, 0.62)
                             brake = 0.0
                         else:
                             throttle = 0.0
-                            brake = min(1.0, -speed_error * 0.6)
+                            brake = min(1.0, -speed_error * 0.5)
                     
                     # 下发控制指令给 Carla 的汽车
                     vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=out_steer, brake=brake))
             else:
-                # 若走到了 200 米路径尽头，一脚踩死刹车停止
+                # 若走到参考路径尽头，一脚踩死刹车停止
                 vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
-                print("\n🎉 已顺利抵达参考路径终点（200米），自动跳出并开始保存！")
+                print("\n🎉 已顺利抵达参考路径终点，自动跳出并开始保存！")
                 break  # 停止死循环，主动进入 finally 去保存文件！
 
             # --- 6.4 打印车速与建图信息 ---

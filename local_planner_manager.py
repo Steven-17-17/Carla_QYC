@@ -99,7 +99,7 @@ class LocalPathPlannerWrapper:
         
         print(f"🧩 [LocalPathPlannerWrapper] 局部路径规划器初始化完毕! (挂车节数: {num_trailers})")
 
-    def run_step(self, current_loc, current_yaw_rad, current_v, dyn_obs, stat_obs, replan_time):
+    def run_step(self, current_loc, current_yaw_rad, current_v, dyn_obs, stat_obs, replan_time, current_trailer_states=None):
         """
         每帧更新环境并执行一次触须规划，缓存最优结果
         """
@@ -166,7 +166,7 @@ class LocalPathPlannerWrapper:
             current_pos=[current_loc.x, current_loc.y],
             current_yaw=current_yaw_rad,
             current_speed=current_v,
-            current_trailer_states=None, # 先用计算推演的挂车状态
+            current_trailer_states=current_trailer_states,
             elapsed_time=replan_time
         )
 
@@ -237,10 +237,28 @@ class LocalPathPlannerWrapper:
             if self.last_total_count > 0 and self.last_valid_count == 0 and self.nearest_dynamic_obs_dist < 12.0:
                 target_v = min(target_v, 0.3)
 
-            # 稀疏采样几何点，让 NMPC 获得更大的前瞻空间
+            # 稀疏采样几何点时按曲率自适应，避免弯道目标过远导致提前转向
             geom_len = len(self.geom_traj)
+            geom_arr = np.asarray(self.geom_traj, dtype=float)
+            sample_step = 3
+            if geom_arr.shape[0] >= 3:
+                dyaw = np.array([
+                    math.atan2(
+                        math.sin(geom_arr[i + 1, 2] - geom_arr[i, 2]),
+                        math.cos(geom_arr[i + 1, 2] - geom_arr[i, 2])
+                    )
+                    for i in range(geom_arr.shape[0] - 1)
+                ])
+                ds = np.hypot(np.diff(geom_arr[:, 0]), np.diff(geom_arr[:, 1]))
+                ds = np.maximum(ds, 1e-4)
+                local_kappa = np.median(np.abs(dyaw / ds))
+                if local_kappa > 0.085:
+                    sample_step = 1
+                elif local_kappa > 0.04:
+                    sample_step = 2
+
             for k in range(nmpc_horizon):
-                idx = min(k * 3, geom_len - 1) # 采样子步长 * 3
+                idx = min(k * sample_step, geom_len - 1)
                 pt = self.geom_traj[idx]
                 target_trajectory[k, :] = [pt[0], pt[1], pt[2]]
                 
