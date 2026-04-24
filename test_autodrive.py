@@ -2,11 +2,86 @@ import carla
 import time
 import math
 import os
+import csv
 import numpy as np
 import matplotlib.pyplot as plt
 from collections import deque
 from nmpc_controller import NMPCController  # 引入我们刚刚用 Python 改写的 NMPC 核心类
 from local_planner_manager import LocalPathPlannerWrapper # 新增：高度封装的触须接口
+
+
+# ============= 道路边界读取与碰撞检测 =============
+def load_road_boundaries(csv_path='lattice_boundaries_all.csv'):
+    """
+    读取道路边界文件
+    返回: left, right 两个 Nx2 数组
+    """
+    left_pts = []
+    right_pts = []
+    
+    try:
+        with open(csv_path, newline='', encoding='utf-8') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                left_pts.append([float(row['left_boundary_x']), float(row['left_boundary_y'])])
+                right_pts.append([float(row['right_boundary_x']), float(row['right_boundary_y'])])
+        
+        print(f"✅ 成功加载道路边界: 左边界 {len(left_pts)} 个点, 右边界 {len(right_pts)} 个点")
+        return np.array(left_pts), np.array(right_pts)
+    except Exception as e:
+        print(f"⚠️ 读取边界文件失败: {e}")
+        return None, None
+
+
+def check_tentacle_collision_with_boundary(tentacle_xy, left_bound, right_bound, vehicle_width=2.2, safety_margin=0.3):
+    """
+    检查触须和边界的碰撞
+    tentacle_xy: Nx2 的触须轨迹点
+    left_bound, right_bound: 左右边界点
+    vehicle_width: 车辆宽度
+    safety_margin: 安全边距
+    返回: True 表示碰撞 (需要丢弃), False 表示安全
+    """
+    if left_bound is None or right_bound is None:
+        return False
+    
+    half_width = (vehicle_width / 2.0) + safety_margin
+    
+    # 先把边界转为多边形（两个单链）或者用点到线的距离
+    for i in range(len(tentacle_xy)):
+        p = tentacle_xy[i]
+        
+        # 计算到左边界最近点的距离
+        min_dist_left = 1e9
+        for j in range(len(left_bound) - 1):
+            dist = point_to_line_distance(p, left_bound[j], left_bound[j+1])
+            min_dist_left = min(min_dist_left, dist)
+        
+        # 计算到右边界最近点的距离
+        min_dist_right = 1e9
+        for j in range(len(right_bound) - 1):
+            dist = point_to_line_distance(p, right_bound[j], right_bound[j+1])
+            min_dist_right = min(min_dist_right, dist)
+        
+        # 如果离任意一边太近，就算碰撞
+        if min_dist_left < half_width or min_dist_right < half_width:
+            return True
+    
+    return False
+
+
+def point_to_line_distance(p, a, b):
+    """
+    点p到线段ab的最短距离
+    """
+    ap = p - a
+    ab = b - a
+    ab_sq = np.dot(ab, ab)
+    if ab_sq < 1e-6:
+        return np.linalg.norm(ap)
+    t = max(0, min(1, np.dot(ap, ab) / ab_sq))
+    proj = a + t * ab
+    return np.linalg.norm(p - proj)
 
 def main():
     def pick_small_obstacle_blueprints(bp_lib):
@@ -67,6 +142,9 @@ def main():
     spectator = world.get_spectator()
     
     print("✅ 成功连接UE5 Carla仿真环境！")
+    
+    # ================== 加载道路边界 ==================
+    left_bound, right_bound = load_road_boundaries('lattice_boundaries_all.csv')
 
     # ================== 2. 生成车辆 ==================
     try:
@@ -109,104 +187,20 @@ def main():
     bbox = vehicle.bounding_box.extent
     print(f"📏 [车辆尺寸信息] 牵引车真实尺寸为: 长 {bbox.x * 2:.3f} 米, 宽 {bbox.y * 2:.3f} 米, 高 {bbox.z * 2:.3f} 米")
 
-    # ================== 2.2 生成一些随机障碍物（展示上帝视角感知） ==================
-    print("🚗 正在前方道路上专门生成静态障碍物用于测试局部路径规划（避障）...")
+    # ================== 初始化障碍物相关变量 ==================
     obstacle_actors = []
     obstacle_actor_ids = set()
-    collided_test_obstacle_ids = set()
-    
-    # 获取当前道路，并在正前方距离 20 米、45 米处分别生成停放车辆或路障
     base_wp = world.get_map().get_waypoint(spawn_point.location)
-    
-    # 定义我们在前方多少米处放置路障
-    obstacle_distances = [25.0, 50.0]
-    # 定义横向偏移偏移量（模拟车辆占用了半个车道或整个车道）
-    obstacle_offsets = [0.5, -0.8] 
-
     small_obstacle_bps = pick_small_obstacle_blueprints(blueprint_library)
-    print(f"🚧 固定小车障碍蓝图库: {[bp.id for bp in small_obstacle_bps[:4]]}")
 
-    for i, dist in enumerate(obstacle_distances):
-        try:
-            # 往前推进找到目标路点
-            obs_wp = base_wp.next(dist)[0]
-            
-            # 计算路点的朝向
-            forward_vec = obs_wp.transform.get_forward_vector()
-            right_vec = obs_wp.transform.get_right_vector()
-            
-            # 在路点上加入横向偏移产生最终位置
-            obs_loc = obs_wp.transform.location + right_vec * obstacle_offsets[i]
-            obs_loc.z += 0.5 # 适度抬高防卡在地下
-            
-            # 固定用小车作为障碍物，避免随机生成大巴/重卡导致可通行性失真
-            obs_bp = small_obstacle_bps[i % len(small_obstacle_bps)]
-            obs_transform = carla.Transform(obs_loc, obs_wp.transform.rotation)
-            
-            obs_vehicle = world.try_spawn_actor(obs_bp, obs_transform)
-            if obs_vehicle:
-                # 将生成的车辆的手刹和物理静态化
-                obs_vehicle.set_autopilot(False)
-                obs_vehicle.apply_control(carla.VehicleControl(throttle=0.0, brake=1.0, hand_brake=True))
-                obstacle_actors.append(obs_vehicle)
-                obstacle_actor_ids.add(obs_vehicle.id)
-        except Exception as e:
-            pass
-    print(f"✅ 成功生成了 {len(obstacle_actors)} 个精确放置的前方静态路障！测试触须法避障启动。")
-
-    # ================== 2.3 生成动态障碍物（用于速度规划能力测试） ==================
-    print("🚙 正在生成动态障碍物，用于测试速度规划（跟驰/减速/再加速）...")
+    # ================== 2.3 初始化动态障碍物变量 ==================
     dynamic_obstacle_actors = []
-
-    # 说明：
-    # - 距离放在静态障碍后方更远处，避免一开始就混在一起导致难以分辨问题来源。
-    # - 速度单位 m/s（3.0m/s≈10.8km/h）。
+    dynamic_obstacle_states = []  # 存储每个动态障碍物的状态：车辆、当前路径索引、目标速度
     dynamic_obstacle_specs = [
-        {'distance': 58.0, 'offset': 0.10, 'speed': 3.0},
-        {'distance': 76.0, 'offset': -0.20, 'speed': 4.2},
-        {'distance': 94.0, 'offset': 0.25, 'speed': 2.4},
+        {'start_index': 30, 'speed': 3.0},
+        {'start_index': 80, 'speed': 4.2},
+        {'start_index': 150, 'speed': 2.4},
     ]
-
-    for i, spec in enumerate(dynamic_obstacle_specs):
-        try:
-            dyn_wp = base_wp.next(float(spec['distance']))[0]
-            right_vec = dyn_wp.transform.get_right_vector()
-            fwd_vec = dyn_wp.transform.get_forward_vector()
-
-            dyn_loc = dyn_wp.transform.location + right_vec * float(spec['offset'])
-            dyn_loc.z += 0.5
-
-            dyn_bp = small_obstacle_bps[(i + len(obstacle_distances)) % len(small_obstacle_bps)]
-            dyn_tf = carla.Transform(dyn_loc, dyn_wp.transform.rotation)
-            dyn_vehicle = world.try_spawn_actor(dyn_bp, dyn_tf)
-            if dyn_vehicle is None:
-                continue
-
-            dyn_vehicle.set_autopilot(False)
-            dynamic_obstacle_actors.append(dyn_vehicle)
-            obstacle_actors.append(dyn_vehicle)
-            obstacle_actor_ids.add(dyn_vehicle.id)
-
-            target_speed = float(spec['speed'])
-            vel_vec = carla.Vector3D(
-                x=fwd_vec.x * target_speed,
-                y=fwd_vec.y * target_speed,
-                z=0.0,
-            )
-
-            # 优先使用恒速模式，确保动态障碍可持续移动且速度稳定。
-            try:
-                dyn_vehicle.enable_constant_velocity(vel_vec)
-            except Exception:
-                dyn_vehicle.set_target_velocity(vel_vec)
-
-        except Exception:
-            continue
-
-    print(
-        f"✅ 动态障碍物生成完成：{len(dynamic_obstacle_actors)} 辆 "
-        f"(目标速度: {[round(s['speed']*3.6, 1) for s in dynamic_obstacle_specs]} km/h)"
-    )
     # ================== 2.5 生成并可视化二维空间的“参考路径” ==================
     carla_map = world.get_map()
     # 1. 找到车辆出生点对应的地图路点（归到车道中心线上）
@@ -273,86 +267,48 @@ def main():
 
     print(f"🛣️ 成功生成全图级参考路径: {len(reference_path)} 个 Waypoint, 约 {route_len:.1f} m")
 
-    # ================== 3. 加装激光雷达 ==================
-    # 3.1 找到激光雷达蓝图
-    lidar_bp = blueprint_library.find('sensor.lidar.ray_cast')
-    
-    # 3.2 配置激光雷达参数（可根据需要调整）
-    lidar_bp.set_attribute('channels', '64')          # 32线
-    lidar_bp.set_attribute('points_per_second', '56000')  # 每秒点数
-    lidar_bp.set_attribute('rotation_frequency', '10') # 旋转频率（Hz）
-    lidar_bp.set_attribute('range', '50')              # 探测距离（米）
-    
-    # 3.3 安装位置：车顶正上方
-    lidar_transform = carla.Transform(carla.Location(x=0.0, z=2.5))
-    lidar = world.spawn_actor(lidar_bp, lidar_transform, attach_to=vehicle)
+    # ================== 2.3 生成动态障碍物 ==================
+    print("🚙 正在生成动态障碍物，用于测试速度规划（跟驰/减速/再加速）...")
+    for i, spec in enumerate(dynamic_obstacle_specs):
+        try:
+            start_idx = min(spec['start_index'], len(reference_path) - 1)
+            dyn_wp = reference_path[start_idx]
 
-    # 3.3.1 碰撞传感器：用于诊断“撞后速度趋近0”的原因
-    collision_state = {
-        'count': 0,
-        'last_actor_id': -1,
-        'last_actor_type': 'none',
-        'last_impulse': 0.0,
-        'last_time': -1.0,
-    }
-    collision_bp = blueprint_library.find('sensor.other.collision')
-    collision_sensor = world.spawn_actor(collision_bp, carla.Transform(), attach_to=vehicle)
-    
-    # 3.4 定义全局地图存储（不再限制帧数，保存整个走过的区域建图）
-    global_map_list = []
+            dyn_loc = dyn_wp.transform.location
+            dyn_loc.z += 0.5
 
-    # 3.5 定义激光雷达数据回调函数
-    def lidar_callback(data):
-        # 将Carla的激光雷达对象转换为numpy数组格式
-        # 注意: np.frombuffer返回的是只读视图，必须加上 .copy() 才能修改
-        points = np.frombuffer(data.raw_data, dtype=np.float32).reshape(-1, 4)[:, :3].copy()
-        
-        # 简单降采样（取五分之一），避免200米的全局点云太大导致系统卡死
-        points = points[::5]
+            dyn_bp = small_obstacle_bps[i % len(small_obstacle_bps)]
+            dyn_tf = carla.Transform(dyn_loc, dyn_wp.transform.rotation)
+            dyn_vehicle = world.try_spawn_actor(dyn_bp, dyn_tf)
+            if dyn_vehicle is None:
+                continue
 
-        # 翻转 y 轴以将左手系(Carla)转为正常的右手观察系(Open3D)
-        points[:, 1] = -points[:, 1]
-        
-        # 获取当前传感器位姿矩阵，将局部点云转换到全局坐标系以防止移动模糊
-        sensor_matrix = lidar.get_transform().get_matrix()
-        # 补充齐次坐标列
-        points_homo = np.hstack((points, np.ones((points.shape[0], 1))))
-        points_world = (np.array(sensor_matrix) @ points_homo.T).T[:, :3]
-        
-        global_map_list.append(points_world)
+            dyn_vehicle.set_autopilot(False)
+            dynamic_obstacle_actors.append(dyn_vehicle)
+            obstacle_actors.append(dyn_vehicle)
+            obstacle_actor_ids.add(dyn_vehicle.id)
 
-    def collision_callback(event):
-        other = event.other_actor
-        oid = other.id if other is not None else -1
-        otype = other.type_id if other is not None else 'none'
-        imp = event.normal_impulse
-        imp_mag = float(math.sqrt(imp.x * imp.x + imp.y * imp.y + imp.z * imp.z))
+            # 保存动态障碍物状态
+            dynamic_obstacle_states.append({
+                'vehicle': dyn_vehicle,
+                'current_wp_index': start_idx,
+                'target_speed': float(spec['speed']),
+            })
 
-        collision_state['count'] += 1
-        collision_state['last_actor_id'] = oid
-        collision_state['last_actor_type'] = otype
-        collision_state['last_impulse'] = imp_mag
-        collision_state['last_time'] = time.time()
+        except Exception:
+            continue
 
-        if oid in obstacle_actor_ids:
-            collided_test_obstacle_ids.add(oid)
+    print(
+        f"✅ 动态障碍物生成完成：{len(dynamic_obstacle_actors)} 辆 "
+        f"(目标速度: {[round(s['speed']*3.6, 1) for s in dynamic_obstacle_specs]} km/h)"
+    )
 
-        print(
-            f"\n[Collision] count={collision_state['count']} actor={otype}#{oid} "
-            f"impulse={imp_mag:.2f} collided_test={oid in obstacle_actor_ids}"
-        )
-    
-    # 3.6 开始监听激光雷达数据
-    lidar.listen(lidar_callback)
-    collision_sensor.listen(collision_callback)
-    print("✅ 激光雷达安装成功，开始进行全局路线建图！")
-
-    # ================== 4. 关闭自带自动驾驶，准备使用自定义循迹 ==================
+    # ================== 3. 关闭自带自动驾驶，准备使用自定义循迹 ==================
     vehicle.set_autopilot(False)
     
-    # 实例化 Python 版本的 NMPC
+    # 实例化 Python 版本的 Stanley 控制器
     nmpc_horizon = 15  # 默认预测步数 15，控制器内部会按曲率自适应
-    planner = NMPCController(N=nmpc_horizon, dt=0.1)
+    planner = NMPCController(N=nmpc_horizon, dt=0.05)
 
     target_wp_index = 0
     print("🚗 车辆已切换为【Python NMPC 控制】，无视红绿灯、强行沿轨迹行驶！")
@@ -410,7 +366,7 @@ def main():
     trailer_hitch = trailer_hitch_gaps if len(trailer_hitch_gaps) > 0 else 2.1
 
     print(f"📐 规划器尺寸参数: tractor=({tractor_length:.2f}m x {tractor_width:.2f}m), trailers={len(trailer_lengths)}")
-    local_planner_wrapper = LocalPathPlannerWrapper(dt=0.1, planning_horizon=4.5)
+    local_planner_wrapper = LocalPathPlannerWrapper(dt=0.05, planning_horizon=4.5)
     local_planner_wrapper.initialize_planner(
         num_trailers=num_trailers,
         tractor_length=tractor_length,
@@ -420,12 +376,34 @@ def main():
         trailer_hitch_gap=trailer_hitch,
         reference_path=reference_path
     )
+    
+    # 设置道路边界
+    local_planner_wrapper.set_road_boundaries(left_bound, right_bound)
 
     # 建立历史轨迹缓存
     actual_x = []
     actual_y = []
     
     frame_count = 0
+    # 频率测量变量
+    last_print_time = time.time()
+    last_frame_count = 0
+    last_planning_count = 0
+    control_freq = 0.0
+    planning_freq = 0.0
+    # 规划计数 - 假设每帧都重新规划
+    planning_count = 0
+    # 控制平滑变量
+    last_throttle = 0.0
+    last_brake = 0.0
+    last_steer = 0.0
+    throttle_brake_smooth = 0.3  # 油门刹车平滑系数
+    steer_smooth = 0.4  # 转向平滑系数
+    
+    # 多频率架构
+    cached_trajectory = None  # 缓存的规划轨迹
+    cached_target_v = None  # 缓存的目标速度
+    best_tentacle_traj = None  # 缓存用于可视化
 
     # ================== 5.5 【上帝视角】获取环境中所有的动态与静态障碍物 ==================
     print("🌍 正在提取地图静态物体(建筑、树木、围墙)...")
@@ -453,7 +431,7 @@ def main():
     def get_obstacles(world, ego_vehicle, ignore_actors=None):
         if ignore_actors is None:
             ignore_actors = []
-        ignore_ids = [ego_vehicle.id] + [a.id for a in ignore_actors] + list(collided_test_obstacle_ids)
+        ignore_ids = [ego_vehicle.id] + [a.id for a in ignore_actors]
         
         dyn_obstacles = []
         # 获取所有的动态车辆和行人
@@ -523,34 +501,73 @@ def main():
 
         return dyn_obstacles, stat_obstacles_plan, stat_obstacles_viz
 
-    def estimate_path_curvature(path_xyz):
-        """
-        估计局部参考轨迹曲率（取前半段中位值，强调即将到来的弯道）。
-        path_xyz: np.ndarray shape (N, 3) -> [x,y,yaw]
-        """
-        if path_xyz is None or len(path_xyz) < 3:
-            return 0.0
-
-        arr = np.asarray(path_xyz, dtype=float)
-        if arr.ndim != 2 or arr.shape[0] < 3:
-            return 0.0
-
-        n = arr.shape[0]
-        seg_n = max(3, n // 2)
-        dx = np.diff(arr[:seg_n, 0])
-        dy = np.diff(arr[:seg_n, 1])
-        ds = np.hypot(dx, dy)
-        ds = np.maximum(ds, 1e-4)
-        dyaw = np.diff(arr[:seg_n, 2])
-        dyaw = np.arctan2(np.sin(dyaw), np.cos(dyaw))
-        kappa = np.abs(dyaw / ds)
-        if kappa.size == 0:
-            return 0.0
-        return float(np.median(kappa))
-
     # ================== 6. 主循环：更新跟随视角 + 打印车速 ==================
     try:
         while True:
+            # 记录循环开始时间
+            loop_start_time = time.time()
+            
+            # --- 6.0 控制动态障碍物沿参考路径行驶 ---
+            for dyn_state in dynamic_obstacle_states:
+                dyn_vehicle = dyn_state['vehicle']
+                if not dyn_vehicle.is_alive:
+                    continue
+                    
+                # 获取动态障碍物当前状态
+                dyn_tf = dyn_vehicle.get_transform()
+                dyn_loc = dyn_tf.location
+                dyn_yaw = math.radians(dyn_tf.rotation.yaw)
+                dyn_velocity = dyn_vehicle.get_velocity()
+                dyn_v = math.hypot(dyn_velocity.x, dyn_velocity.y)
+                
+                # 更新当前路径索引
+                current_idx = dyn_state['current_wp_index']
+                target_wp = reference_path[current_idx]
+                target_loc = target_wp.transform.location
+                
+                # 计算到目标路点的距离
+                dist = math.hypot(target_loc.x - dyn_loc.x, target_loc.y - dyn_loc.y)
+                
+                # 如果接近目标路点，切换到下一个
+                if dist < 1.8:
+                    current_idx += 1
+                    # 到达路径终点时回到起点（绕圈）
+                    if current_idx >= len(reference_path):
+                        current_idx = 0
+                    dyn_state['current_wp_index'] = current_idx
+                    target_wp = reference_path[current_idx]
+                    target_loc = target_wp.transform.location
+                
+                # 计算到下一个路点的方向
+                target_yaw = math.radians(target_wp.transform.rotation.yaw)
+                dyaw = target_yaw - dyn_yaw
+                # 标准化角度差到 [-pi, pi]
+                dyaw = math.atan2(math.sin(dyaw), math.cos(dyaw))
+                
+                # 简单的横向控制：根据角度差计算转向
+                max_steer_rad = 30.0 * math.pi / 180.0
+                steer = max(-1.0, min(1.0, dyaw / max_steer_rad))
+                
+                # 速度控制
+                target_speed = dyn_state['target_speed']
+                speed_error = target_speed - dyn_v
+                throttle = 0.0
+                brake = 0.0
+                
+                if target_speed < 0.1:
+                    throttle = 0.0
+                    brake = 1.0
+                else:
+                    if speed_error > 0.0:
+                        throttle = min(1.0, 0.3 + speed_error * 1.5)
+                        brake = 0.0
+                    else:
+                        throttle = 0.0
+                        brake = min(1.0, -speed_error * 0.5)
+                
+                # 应用控制
+                dyn_vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=steer, brake=brake))
+            
             # --- 6.1 更新跟随视角（核心代码） ---
             # 获取车辆当前的位置和旋转
             vehicle_transform = vehicle.get_transform()
@@ -588,10 +605,10 @@ def main():
             max_steer_rad = 30.0 * math.pi / 180.0
             actual_steer_rad = current_steer * max_steer_rad
 
-            # =============== 【新增】使用封装后的本地规划器接口 ===============
+            # =============== 多频率架构：规划每3帧，控制每帧 ===============
             replan_time = frame_count * 0.05
 
-            # 将 Carla 中每节挂车的实时位姿回传给重规划，避免使用车头姿态重置挂车状态。
+            # 获取挂车状态（如果有的话）
             current_trailer_states = None
             if len(potential_trailers) > 0:
                 trailer_states_buf = []
@@ -607,29 +624,64 @@ def main():
                 if len(trailer_states_buf) > 0:
                     current_trailer_states = trailer_states_buf
 
-            best_tentacle_traj = local_planner_wrapper.run_step(
-                current_loc=current_loc,
-                current_yaw_rad=current_yaw_rad,
-                current_v=current_v,
-                dyn_obs=dyn_obs,
-                stat_obs=stat_obs_plan,
-                replan_time=replan_time,
-                current_trailer_states=current_trailer_states,
-            )
-            # ================================================================
+            # 判断是否还在参考路径以内
+            if target_wp_index < len(reference_path):
+                # 获取当前车辆与目标的坐标
+                target_wp = reference_path[target_wp_index]
+                target_loc = target_wp.transform.location
+                
+                # 计算二维距离
+                dist = math.hypot(target_loc.x - current_loc.x, target_loc.y - current_loc.y)
+                
+                # 更新目标路点
+                if dist < 1.8:
+                    target_wp_index += 1
+                
+                # --- 规划模块：每3帧运行一次 ---
+                if frame_count % 3 == 0 or cached_trajectory is None:
+                    # 执行触须法规划
+                    best_tentacle_traj = local_planner_wrapper.run_step(
+                        current_loc=current_loc,
+                        current_yaw_rad=current_yaw_rad,
+                        current_v=current_v,
+                        dyn_obs=dyn_obs,
+                        stat_obs=stat_obs_plan,
+                        replan_time=replan_time,
+                        current_trailer_states=current_trailer_states,
+                    )
+                    
+                    # 获取规划的轨迹和速度
+                    if target_wp_index < len(reference_path):
+                        target_trajectory, target_v = local_planner_wrapper.get_tracked_trajectory(
+                            nmpc_horizon=nmpc_horizon,
+                            current_v=current_v, 
+                            fallback_wps=reference_path, 
+                            target_wp_index=target_wp_index
+                        )
+                        cached_trajectory = target_trajectory
+                        cached_target_v = target_v
+                    planning_count += 1
+                else:
+                    target_trajectory = cached_trajectory
+                    target_v = cached_target_v
 
-            # 每隔 3 帧更新一次画图，避免把 matplotlib 画死卡顿
+            # 每隔 3 帧更新一次画图
             if frame_count % 3 == 0:
                 ax.cla()
                 
-                # 绘制1：将激光雷达 3D 点云拍平成 2D (去掉Z轴)，每 50 个点抽稀一下画灰色背景墙
-                if len(global_map_list) > 0:
-                    xyz = np.vstack(global_map_list)
-                    pts = xyz[::50] # 强力抽稀
-                    ax.plot(pts[:, 0], pts[:, 1], '.', color='lightgray', markersize=1, label='LiDAR Map (2D)')
-                
-                # 绘制2：用绿色画出长路参考线
+                # 绘制1：用绿色画出长路参考线
                 ax.plot(ref_x, ref_y, 'g--', linewidth=2, label='Reference Path')
+                
+                # 绘制边界：左边界和右边界
+                if left_bound is not None and len(left_bound) > 0:
+                    lb_x = [float(p[0]) for p in left_bound]
+                    lb_y = [float(p[1]) for p in left_bound]
+                    ax.plot(lb_x, lb_y, 'c-', linewidth=1.5, label='Left Boundary')
+                
+                if right_bound is not None and len(right_bound) > 0:
+                    rb_x = [float(p[0]) for p in right_bound]
+                    rb_y = [float(p[1]) for p in right_bound]
+                    ax.plot(rb_x, rb_y, 'm-', linewidth=1.5, label='Right Boundary')
                 
                 # 绘制3：用红色画出车辆过去实走的轨迹
                 ax.plot(actual_x, actual_y, 'r-', linewidth=2, label='Actual Follow Path')
@@ -665,126 +717,63 @@ def main():
                 except Exception:
                     pass
 
-            # --- 6.3 【核心】自定义位置寻迹控制 ---
+            # --- 6.3 【核心】控制模块（每帧运行） ---
             final_target_v = 0.0
             throttle = 0.0
             brake = 0.0
+            out_steer = 0.0
 
             # 判断是否还在参考路径以内
-            if target_wp_index < len(reference_path):
-                # 获取当前车辆与目标的坐标
-                target_wp = reference_path[target_wp_index]
-                target_loc = target_wp.transform.location
+            if target_wp_index < len(reference_path) and cached_trajectory is not None:
+                target_trajectory = cached_trajectory
+                target_v_ref = float(cached_target_v)
                 
-                # 计算二维距离
-                dist = math.hypot(target_loc.x - current_loc.x, target_loc.y - current_loc.y)
+                # 调用完整NMPC控制器（直接输出throttle, brake, steer）
+                state = [current_loc.x, current_loc.y, current_yaw_rad, current_v]
+                throttle, brake, steer_out = planner.solve(
+                    state,
+                    target_trajectory,
+                    target_speed=target_v_ref,
+                )
                 
-                # 减小切点半径，避免在弯道提前切到后续点导致“提早转弯”
-                if dist < 1.8:
-                    target_wp_index += 1
+                # 对控制指令进行平滑滤波
+                throttle_smooth = throttle_brake_smooth * throttle + (1 - throttle_brake_smooth) * last_throttle
+                brake_smooth = throttle_brake_smooth * brake + (1 - throttle_brake_smooth) * last_brake
+                steer_smooth_val = steer_smooth * steer_out + (1 - steer_smooth) * last_steer
                 
-                if target_wp_index < len(reference_path):
-                    # 【核心核心】：调用刚刚封装好的接口拿去 NMPC 的追踪轨迹和速度
-                    state = [current_loc.x, current_loc.y, current_yaw_rad, current_v]
-                    
-                    target_trajectory, target_v = local_planner_wrapper.get_tracked_trajectory(
-                        nmpc_horizon=nmpc_horizon,
-                        current_v=current_v, 
-                        fallback_wps=reference_path, 
-                        target_wp_index=target_wp_index
-                    )
-
-                    # 调用我们自己写的 Python 版本 NMPC
-                    # 远离动态障碍时，提高速度参考下限（仅直道生效），避免重载低速爬行。
-                    local_kappa = estimate_path_curvature(target_trajectory)
-                    target_v_ref = float(target_v)
-                    nearest_dyn = float(local_planner_wrapper.nearest_dynamic_obs_dist)
-                    is_straight = local_kappa < 0.035
-                    if is_straight:
-                        if nearest_dyn > 22.0:
-                            target_v_ref = max(target_v_ref, 3.0)
-                        elif nearest_dyn > 14.0:
-                            target_v_ref = max(target_v_ref, 2.2)
-                        elif nearest_dyn > 10.0:
-                            target_v_ref = max(target_v_ref, 1.6)
-
-                    # 弯道限速：按横向加速度上限计算速度帽，抑制“全油门过弯”
-                    a_lat_limit = 1.6
-                    if local_kappa > 1e-4:
-                        v_curve_cap = math.sqrt(a_lat_limit / local_kappa)
-                        # 给一个下限，避免极端曲率下直接锁死
-                        v_curve_cap = max(0.8, min(v_curve_cap, 6.0))
-                        target_v_ref = min(target_v_ref, v_curve_cap)
-
-                    optimized_v, target_steer_rad = planner.solve(
-                        state,
-                        target_trajectory,
-                        target_speed=target_v_ref,
-                    )
-
-                    # 由 NMPC 同时控制速度与转向；target_v 作为速度参考而非直接执行值
-                    final_target_v = max(0.0, float(optimized_v))
-
-                    # 结合实际转角再做一次横向加速度限速，避免求解噪声导致的弯中速度偏高
-                    cmd_kappa = abs(math.tan(target_steer_rad) / max(1e-6, 3.0))
-                    if cmd_kappa > 1e-4:
-                        v_cmd_curve_cap = math.sqrt(a_lat_limit / cmd_kappa)
-                        v_cmd_curve_cap = max(0.8, min(v_cmd_curve_cap, 6.0))
-                        final_target_v = min(final_target_v, v_cmd_curve_cap)
-                    
-                    # 将 NMPC 优化出来的物理命令转化为 Carla 阿克曼控制量
-                    out_steer = max(-1.0, min(1.0, target_steer_rad / max_steer_rad))
-                    speed_error = final_target_v - current_v
-                    
-                    # 取消过大的0.5m/s (即1.8km/h)静区死区，改为更灵敏连续的比例控制，并且起步给大点油门
-                    if final_target_v < 0.1:
-                        throttle = 0.0
-                        brake = 1.0 # 要求刹停时给满刹车
-                    else:
-                        if speed_error > 0.0:
-                            # 牵引增强：重载起步给更高基础油门，防止长期<1km/h的爬行。
-                            throttle = min(1.0, 0.40 + speed_error * 1.6)
-
-                            # 弯道油门上限，进一步抑制“全油门过弯”
-                            if local_kappa > 0.08:
-                                throttle = min(throttle, 0.38)
-                            elif local_kappa > 0.05:
-                                throttle = min(throttle, 0.50)
-                            elif local_kappa > 0.03:
-                                throttle = min(throttle, 0.62)
-
-                            if current_v < 1.5 and final_target_v > 1.5:
-                                throttle = max(throttle, 0.75)
-                            if current_v < 0.8 and final_target_v > 2.5:
-                                throttle = max(throttle, 0.90)
-
-                            # 若处于明显弯道，禁止起步增强把油门重新抬高到过激值
-                            if local_kappa > 0.03:
-                                throttle = min(throttle, 0.62)
-                            brake = 0.0
-                        else:
-                            throttle = 0.0
-                            brake = min(1.0, -speed_error * 0.5)
-                    
-                    # 下发控制指令给 Carla 的汽车
-                    vehicle.apply_control(carla.VehicleControl(throttle=throttle, steer=out_steer, brake=brake))
+                # 更新历史值
+                last_throttle = throttle_smooth
+                last_brake = brake_smooth
+                last_steer = steer_smooth_val
+                
+                # 应用平滑后的控制
+                vehicle.apply_control(carla.VehicleControl(throttle=throttle_smooth, steer=steer_smooth_val, brake=brake_smooth))
             else:
-                # 若走到参考路径尽头，一脚踩死刹车停止
+                # 若走到参考路径尽头，停止
                 vehicle.apply_control(carla.VehicleControl(throttle=0.0, steer=0.0, brake=1.0))
                 print("\n🎉 已顺利抵达参考路径终点，自动跳出并开始保存！")
                 break  # 停止死循环，主动进入 finally 去保存文件！
 
-            # --- 6.4 打印车速与建图信息 ---
+            # --- 6.4 打印车速与状态信息 ---
             velocity = vehicle.get_velocity()
             speed = 3.6 * math.hypot(velocity.x, velocity.y)
-            pts_cnt = len(xyz) if len(global_map_list) > 0 and 'xyz' in locals() else 0
+            
+            # 计算频率 - 每秒更新一次
+            current_time = time.time()
+            time_elapsed = current_time - last_print_time
+            if time_elapsed >= 1.0:
+                control_freq = (frame_count - last_frame_count) / time_elapsed
+                planning_freq = (planning_count - last_planning_count) / time_elapsed if time_elapsed > 0 else 0.0
+                last_print_time = current_time
+                last_frame_count = frame_count
+                last_planning_count = planning_count
             
             print(
                 f"\r进度: {target_wp_index}/{len(reference_path)} | 速度: {speed:>4.1f}km/h "
-                f"| 指令: {final_target_v*3.6:>4.1f}km/h | 油门: {throttle:>4.2f} "
+                f"| 触须速度指令: {target_v_ref*3.6:>4.1f}km/h | 油门: {throttle:>4.2f} "
                 f"| 最近动态障碍: {local_planner_wrapper.nearest_dynamic_obs_dist:>5.2f}m "
                 f"| 有效触须: {local_planner_wrapper.last_valid_count}/{local_planner_wrapper.last_total_count} "
-                f"| 碰撞: {collision_state['count']} | 点云: {pts_cnt} 点",
+                f"| 控制频率: {control_freq:>5.1f}Hz | 规划频率: {planning_freq:>5.1f}Hz",
                 end="",
                 flush=True,
             )
@@ -807,11 +796,6 @@ def main():
             settings.synchronous_mode = False
             settings.fixed_delta_seconds = None
             world.apply_settings(settings)
-            
-        if 'lidar' in locals() and lidar.is_alive:
-            lidar.destroy()  # 先销毁传感器
-        if 'collision_sensor' in locals() and collision_sensor.is_alive:
-            collision_sensor.destroy()
             
         if 'world' in locals():
             # 斩草除根：不限于 'vehicle.*'，只要沾边的 Actor 一律强行抹除
