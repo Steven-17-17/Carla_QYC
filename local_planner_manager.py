@@ -99,6 +99,20 @@ class LocalPathPlannerWrapper:
         
         print(f"🧩 [LocalPathPlannerWrapper] 局部路径规划器初始化完毕! (挂车节数: {num_trailers})")
 
+    def set_road_boundaries(self, left_boundary, right_boundary):
+        """
+        设置道路边界
+        left_boundary: Nx2 数组或列表
+        right_boundary: Nx2 数组或列表
+        """
+        if left_boundary is not None:
+            self.left_boundary = left_boundary
+        if right_boundary is not None:
+            self.right_boundary = right_boundary
+        
+        if left_boundary is not None or right_boundary is not None:
+            print(f"🧱 [LocalPathPlannerWrapper] 道路边界已设置: 左={len(left_boundary) if left_boundary is not None else 0} 个点, 右={len(right_boundary) if right_boundary is not None else 0} 个点")
+
     def run_step(self, current_loc, current_yaw_rad, current_v, dyn_obs, stat_obs, replan_time, current_trailer_states=None):
         """
         每帧更新环境并执行一次触须规划，缓存最优结果
@@ -157,7 +171,7 @@ class LocalPathPlannerWrapper:
                     'width': obs_width,
                 })
 
-        self.local_planner.environment = {'obstacles': obs_list, 'left_boundary': None, 'right_boundary': None}
+        self.local_planner.environment = {'obstacles': obs_list, 'left_boundary': getattr(self, 'left_boundary', None), 'right_boundary': getattr(self, 'right_boundary', None)}
         self.local_planner.dynamic_obstacles = dynamic_predictions
 
         # 调用底层接口
